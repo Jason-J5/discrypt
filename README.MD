@@ -9,7 +9,7 @@ before the message is sent
     * This will be done by encrypting the users message with pgp encryption where the user has
 access to their keys and all encryption/decryption is done client side
 ## Things to do
-* - [ ] Base plugin functionality 
+* - [X] Base plugin functionality 
 * - [ ] Add PGP 
 * - [ ] Auto Encrypt/Decrypt
 * - [ ] Key managment system
