@@ -1,5 +1,3 @@
-module.export function genKey(){
-
 const openpgp = require('openpgp'); // use as CommonJS, AMD, ES6 module or via window.openpgp
 
 async function getKeys(){
@@ -12,7 +10,7 @@ async function getKeys(){
     return [publicKey, privateKey]
    // console.log(privateKey)
 }
-}
+
 
 (async () => {
     pubkey = (await getKeys())[0];
