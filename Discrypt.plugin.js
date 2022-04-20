@@ -10,8 +10,8 @@
 
   // use as CommonJS, AMD, ES6 module or via window.openpgp
 
-  var pubKey = require('./pgp.js');
-  console.log(pubKey)
+//   var pubKey = require('./pgp.js');
+//   console.log(pubKey)
 
 
  module.exports = class Discrypt {
@@ -21,7 +21,8 @@
 
     start() {
         //const openpgp = require('openpgp');
-        BdApi.showToast("Discrypt plugin loaded!", {type:"success", icon: true});
+        //BdApi.showToast("Discrypt plugin loaded!", {type:"success", icon: true});
+        BdApi.alert("Welcome to discrypt", "Enjoy");
         
         // async function yesy() { //set the code to repeat without pausing discord itself.
         //     const { privateKey, publicKey } = await openpgp.generateKey({
