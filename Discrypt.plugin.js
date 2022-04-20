@@ -13,6 +13,7 @@
 
     start() {
         BdApi.showToast("Discrypt plugin loaded!", {type:"success", icon: true});
+        console.log("edits")
     } // Required function. Called when the plugin is activated (including after reloads)
     stop() {
         BdApi.showToast("Discrypt plugin stopped!", {type:"success", icon: true});
