@@ -1,8 +1,8 @@
 /**
  * @name Discrypt
  * @author Discrypt
- * @description End-to-end PGP encryption for Discord. Manage keys, encrypt/decrypt messages, and share public keys as contact cards.
- * @version 1.4.0
+ * @description End-to-end PGP encryption for Discord. Manage keys, encrypt/decrypt messages and files, and share public keys as contact cards.
+ * @version 1.5.0
  * @source https://github.com/
  */
 
@@ -71,6 +71,36 @@ async function decryptMessage(armoredMessage, armoredPrivateKey, passphrase) {
   const message = await openpgp.readMessage({ armoredMessage });
   const { data } = await openpgp.decrypt({ message, decryptionKeys: privateKey });
   return data;
+}
+
+async function encryptFile(fileBytes, fileName, recipientArmored, ownPubKeyArmored = null) {
+  const encryptionKeys = [await openpgp.readKey({ armoredKey: recipientArmored })];
+  if (ownPubKeyArmored) {
+    try { encryptionKeys.push(await openpgp.readKey({ armoredKey: ownPubKeyArmored })); } catch {}
+  }
+  const message = await openpgp.createMessage({ binary: new Uint8Array(fileBytes), filename: fileName });
+  const encrypted = await openpgp.encrypt({ message, encryptionKeys, format: "binary" });
+  return encrypted; // Uint8Array
+}
+
+async function decryptFile(encryptedBytes, armoredPrivateKey, passphrase) {
+  const privateKey = await openpgp.decryptKey({
+    privateKey: await openpgp.readPrivateKey({ armoredKey: armoredPrivateKey }),
+    passphrase,
+  });
+  const message = await openpgp.readMessage({ binaryMessage: new Uint8Array(encryptedBytes) });
+  const { data, filename } = await openpgp.decrypt({ message, decryptionKeys: privateKey, format: "binary" });
+  return { data, filename: filename || "decrypted_file" };
+}
+
+function triggerDownload(bytes, filename, mimeType = "application/octet-stream") {
+  const blob = new Blob([bytes], { type: mimeType });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 let _cachedPassphrase = null;
@@ -258,6 +288,15 @@ body.discrypt-always-on [class*="textArea"] {
 .dp-inp:focus { border-color: #5865f2; }
 .dp-btn { border: none; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px; color: #fff; }
 .dp-contact-row { background: #1e1f22; border-radius: 6px; padding: 8px 10px; margin-bottom: 4px; display: flex; align-items: center; justify-content: space-between; }
+.dp-file-drop { border: 2px dashed #4e5058; border-radius: 8px; padding: 16px 12px; text-align: center; color: #b5bac1; font-size: 13px; cursor: pointer; transition: border-color .15s, background .15s; margin-bottom: 8px; }
+.dp-file-drop:hover, .dp-file-drop.dragover { border-color: #5865f2; background: rgba(88,101,242,.08); color: #fff; }
+.dp-file-drop input[type=file] { display: none; }
+.dp-file-selected { background: #1e1f22; border-radius: 6px; padding: 8px 10px; font-size: 12px; color: #b5bac1; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+.dp-file-selected span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.dp-file-clear { background: none; border: none; color: #b5bac1; cursor: pointer; font-size: 14px; flex-shrink: 0; }
+.dp-file-clear:hover { color: #ed4245; }
+.dp-status-ok  { color: #57f287; font-size: 12px; margin-top: 4px; }
+.dp-status-err { color: #ed4245; font-size: 12px; margin-top: 4px; }
 `;
 
 class PGPSettings extends React.Component {
@@ -422,6 +461,10 @@ class DiscryptPanel extends React.Component {
       exportPrivVisible: false,
       showImportPriv: false,
       importPrivKeyText: "",
+      // File encrypt state
+      encFile: null, encContact: "", encStatus: null, encMsg: "",
+      // File decrypt state
+      decFile: null, decStatus: null, decMsg: "",
     };
   }
 
@@ -595,6 +638,118 @@ class DiscryptPanel extends React.Component {
     );
   }
 
+  renderFilesTab() {
+    const { encFile, encContact, encStatus, encMsg, decFile, decStatus, decMsg } = this.state;
+    const contacts = getContacts();
+    const contactEntries = Object.entries(contacts);
+
+    const FilePicker = ({ label, file, onFile, onClear, accept }) => {
+      const inputRef = { current: null };
+      return e("div", null,
+        file
+          ? e("div", { className: "dp-file-selected" },
+              e("span", null, "📄 " + file.name + " (" + (file.size / 1024).toFixed(1) + " KB)"),
+              e("button", { className: "dp-file-clear", onClick: onClear }, "✕"),
+            )
+          : e("div", {
+              className: "dp-file-drop",
+              onClick: () => inputRef.current && inputRef.current.click(),
+              onDragOver: ev => { ev.preventDefault(); ev.currentTarget.classList.add("dragover"); },
+              onDragLeave: ev => ev.currentTarget.classList.remove("dragover"),
+              onDrop: ev => {
+                ev.preventDefault(); ev.currentTarget.classList.remove("dragover");
+                const f = ev.dataTransfer.files[0];
+                if (f) onFile(f);
+              },
+            },
+              e("input", { type: "file", accept, ref: r => { inputRef.current = r; }, onChange: ev => { if (ev.target.files[0]) onFile(ev.target.files[0]); } }),
+              "📁 " + label,
+            ),
+      );
+    };
+
+    const handleEncrypt = async () => {
+      if (!encFile) return showNotice("Select a file to encrypt", "error");
+      if (!encContact) return showNotice("Select a recipient contact", "error");
+      const privKey = Store.get("privateKey", null);
+      if (!privKey) return showNotice("No private key — generate one in Settings", "error");
+      this.setState({ encStatus: "loading", encMsg: "" });
+      try {
+        const buf = await encFile.arrayBuffer();
+        const contact = contacts[encContact];
+        const encrypted = await encryptFile(buf, encFile.name, contact.armoredPublicKey, Store.get("publicKey", null));
+        triggerDownload(encrypted, encFile.name + ".pgp");
+        this.setState({ encStatus: "ok", encMsg: "✅ Encrypted and downloaded as " + encFile.name + ".pgp" });
+      } catch (err) {
+        this.setState({ encStatus: "err", encMsg: "❌ " + err.message });
+      }
+    };
+
+    const handleDecrypt = async () => {
+      if (!decFile) return showNotice("Select a .pgp file to decrypt", "error");
+      const privKey = Store.get("privateKey", null);
+      if (!privKey) return showNotice("No private key — generate one in Settings", "error");
+      this.setState({ decStatus: "loading", decMsg: "" });
+      try {
+        const passphrase = await promptPassphrase("Enter passphrase to decrypt file:");
+        if (!passphrase) { this.setState({ decStatus: null, decMsg: "" }); return; }
+        const buf = await decFile.arrayBuffer();
+        const { data, filename } = await decryptFile(buf, privKey, passphrase);
+        triggerDownload(data, filename || decFile.name.replace(/\.pgp$/i, "") || "decrypted_file");
+        this.setState({ decStatus: "ok", decMsg: "✅ Decrypted and downloaded as " + (filename || "decrypted_file") });
+      } catch (err) {
+        this.setState({ decStatus: "err", decMsg: "❌ " + err.message });
+      }
+    };
+
+    return e("div", null,
+      // ── Encrypt ──
+      e("div", { className: "dp-section-label" }, "Encrypt a File"),
+      e(FilePicker, {
+        label: "Click or drag a file to encrypt",
+        file: encFile,
+        onFile: f => this.setState({ encFile: f, encStatus: null, encMsg: "" }),
+        onClear: () => this.setState({ encFile: null, encStatus: null, encMsg: "" }),
+      }),
+      contactEntries.length > 0
+        ? e("select", {
+            className: "dp-inp",
+            value: encContact,
+            onChange: ev => this.setState({ encContact: ev.target.value }),
+          },
+            e("option", { value: "" }, "— Select recipient —"),
+            ...contactEntries.map(([uid, c]) => e("option", { key: uid, value: uid }, c.username)),
+          )
+        : e("div", { style: { color: "#b5bac1", fontSize: "12px", marginBottom: "8px" } }, "No contacts. Add one in the Contacts tab."),
+      e("button", {
+        className: "dp-btn",
+        style: { background: encStatus === "loading" ? "#4e5058" : "#5865f2", marginBottom: "4px" },
+        onClick: handleEncrypt,
+        disabled: encStatus === "loading",
+      }, encStatus === "loading" ? "Encrypting…" : "🔐 Encrypt & Download"),
+      encMsg && e("div", { className: encStatus === "ok" ? "dp-status-ok" : "dp-status-err" }, encMsg),
+
+      e("div", { style: { borderTop: "1px solid #3f4147", margin: "14px 0" } }),
+
+      // ── Decrypt ──
+      e("div", { className: "dp-section-label" }, "Decrypt a File"),
+      e(FilePicker, {
+        label: "Click or drag a .pgp file to decrypt",
+        file: decFile,
+        onFile: f => this.setState({ decFile: f, decStatus: null, decMsg: "" }),
+        onClear: () => this.setState({ decFile: null, decStatus: null, decMsg: "" }),
+        accept: ".pgp",
+      }),
+      e("button", {
+        className: "dp-btn",
+        style: { background: decStatus === "loading" ? "#4e5058" : "#57f287", color: "#000", marginBottom: "4px" },
+        onClick: handleDecrypt,
+        disabled: decStatus === "loading",
+      }, decStatus === "loading" ? "Decrypting…" : "🔓 Decrypt & Download"),
+      decMsg && e("div", { className: decStatus === "ok" ? "dp-status-ok" : "dp-status-err" }, decMsg),
+    );
+  }
+
   render() {
     const { tab } = this.state;
     const tabBtn = (label, key) => e("button", {
@@ -606,11 +761,13 @@ class DiscryptPanel extends React.Component {
         e("div", { className: "discrypt-panel-tabs" },
           tabBtn("🔑 Keys", "keys"),
           tabBtn("📇 Contacts", "contacts"),
+          tabBtn("📁 Files", "files"),
         ),
         e("button", { className: "discrypt-panel-close", onClick: () => this.props.onClose() }, "✕"),
       ),
       tab === "keys"     && this.renderKeysTab(),
       tab === "contacts" && this.renderContactsTab(),
+      tab === "files"    && this.renderFilesTab(),
     );
   }
 }
