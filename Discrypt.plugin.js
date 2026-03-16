@@ -810,8 +810,6 @@ module.exports = class Discrypt {
     if (this._toolbarInterval) clearInterval(this._toolbarInterval);
     document.querySelectorAll(".discrypt-toolbar-wrap").forEach(el => el.remove());
     document.querySelectorAll(".discrypt-dom-wrap").forEach(el => el.remove());
-    if (this._xhrOpenPatch) { XMLHttpRequest.prototype.open = this._xhrOpenPatch; this._xhrOpenPatch = null; }
-    if (this._xhrSendPatch) { XMLHttpRequest.prototype.send = this._xhrSendPatch; this._xhrSendPatch = null; }
     BdApi.Logger.log(PLUGIN_NAME, "Discrypt stopped");
   }
 
@@ -906,36 +904,29 @@ module.exports = class Discrypt {
 
 
   patchFileUpload() {
-    // Patch XMLHttpRequest.prototype  Discord uses XHR (not fetch) for multipart file uploads.
+    // Discord wraps each file in a CloudUpload instance before any network call.
+    // Patching CloudUpload.prototype.upload is the earliest and most reliable interception point.
     const self = this;
-    const _origOpen = XMLHttpRequest.prototype.open;
-    const _origSend = XMLHttpRequest.prototype.send;
-    this._xhrOpenPatch = _origOpen;
-    this._xhrSendPatch = _origSend;
 
-    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-      this._discryptMethod = method;
-      this._discryptUrl    = url;
-      return _origOpen.call(this, method, url, ...rest);
-    };
+    const tryPatch = (mod) => {
+      if (!mod || !mod.prototype || typeof mod.prototype.upload !== 'function') return false;
+      try {
+        BdApi.Patcher.instead(PLUGIN_NAME, mod.prototype, 'upload', async (thisArg, args, originalFn) => {
+          if (!encryptNextMessage && !alwaysEncrypt) return originalFn.apply(thisArg, args);
 
-    XMLHttpRequest.prototype.send = function(body) {
-      const xhr = this;
-      if (
-        (encryptNextMessage || alwaysEncrypt) &&
-        xhr._discryptUrl &&
-        /\/channels\/\d+\/messages/.test(xhr._discryptUrl) &&
-        body instanceof FormData
-      ) {
-        const fileKeys = [...body.keys()].filter(k => k.startsWith('files['));
-        if (fileKeys.length) {
+          // CloudUpload stores the file as .file or inside .item.file
+          const file = thisArg.file instanceof File ? thisArg.file
+                     : thisArg.item?.file instanceof File ? thisArg.item.file
+                     : null;
+          if (!file) return originalFn.apply(thisArg, args);
+
+          const channelId = thisArg.channelId ?? thisArg.channelId_;
           const privKey = Store.get('privateKey', null);
           if (!privKey) {
             showNotice('No private key -- generate one in Settings', 'error');
-            return _origSend.call(xhr, body);
+            return originalFn.apply(thisArg, args);
           }
 
-          const channelId = (xhr._discryptUrl.match(/\/channels\/(\d+)\//) || [])[1];
           const ChannelStore =
             BdApi.Webpack.getStore?.('ChannelStore') ??
             BdApi.Webpack.getModule(m => m?.getChannel && m?.getDMFromUserId, { first: true }) ??
@@ -956,35 +947,78 @@ module.exports = class Discrypt {
             return; // block upload
           }
 
-          // Async: encrypt then send
-          (async () => {
-            try {
-              const newForm = new FormData();
-              for (const [key, value] of body.entries()) {
-                if (key.startsWith('files[') && value instanceof File) {
-                  const buf       = await value.arrayBuffer();
-                  const encrypted = await encryptFile(buf, value.name, contact.armoredPublicKey, Store.get('publicKey', null));
-                  const encFile   = new File([encrypted], value.name + '.pgp', { type: 'application/octet-stream' });
-                  newForm.append(key, encFile, encFile.name);
-                } else {
-                  newForm.append(key, value);
-                }
-              }
-              encryptNextMessage = false; self.updateToolbarBtn();
-              showNotice('File' + (fileKeys.length > 1 ? 's' : '') + ' encrypted and uploading...', 'success');
-              _origSend.call(xhr, newForm);
-            } catch (err) {
-              BdApi.Logger.error(PLUGIN_NAME, 'File encryption error:', err);
-              showNotice('File encryption failed: ' + err.message, 'error');
-              encryptNextMessage = false; self.updateToolbarBtn();
-              // do not send -- block on error
-            }
-          })();
-          return; // defer send to async block above
-        }
+          try {
+            const buf       = await file.arrayBuffer();
+            const encrypted = await encryptFile(buf, file.name, contact.armoredPublicKey, Store.get('publicKey', null));
+            const encFile   = new File([encrypted], file.name + '.pgp', { type: 'application/octet-stream' });
+
+            // Replace the file on the CloudUpload instance however it's stored
+            if (thisArg.file instanceof File) thisArg.file = encFile;
+            if (thisArg.item?.file instanceof File) thisArg.item = Object.assign({}, thisArg.item, { file: encFile });
+            if (typeof thisArg.filename === 'string')   thisArg.filename   = encFile.name;
+            if (typeof thisArg.spoiler   === 'boolean') {} // preserve other props
+
+            encryptNextMessage = false; self.updateToolbarBtn();
+            showNotice('File encrypted and uploading...', 'success');
+            return originalFn.apply(thisArg, args);
+          } catch (err) {
+            BdApi.Logger.error(PLUGIN_NAME, 'File encryption error:', err);
+            showNotice('File encryption failed: ' + err.message, 'error');
+            encryptNextMessage = false; self.updateToolbarBtn();
+            // do not call originalFn -- block the upload
+          }
+        });
+        return true;
+      } catch (e) {
+        BdApi.Logger.warn(PLUGIN_NAME, 'CloudUpload patch attempt failed:', e);
+        return false;
       }
-      return _origSend.call(this, body);
     };
+
+    // Search for the CloudUpload class with multiple strategies
+    let found = false;
+
+    // 1. Exact: upload + cancel + handleComplete (classic CloudUpload shape)
+    if (!found) {
+      const m = BdApi.Webpack.getModule(
+        m => typeof m === 'function' && m.prototype?.upload && m.prototype?.cancel && m.prototype?.handleComplete,
+        { first: true }
+      );
+      if (tryPatch(m)) { found = true; BdApi.Logger.log(PLUGIN_NAME, 'CloudUpload patched (strategy 1)'); }
+    }
+
+    // 2. Looser: upload + cancel on prototype, function constructor
+    if (!found) {
+      const m = BdApi.Webpack.getModule(
+        m => typeof m === 'function' && m.prototype?.upload && m.prototype?.cancel,
+        { first: true }
+      );
+      if (tryPatch(m)) { found = true; BdApi.Logger.log(PLUGIN_NAME, 'CloudUpload patched (strategy 2)'); }
+    }
+
+    // 3. getWithKey searchExports
+    if (!found && typeof BdApi.Webpack.getWithKey === 'function') {
+      try {
+        const res = BdApi.Webpack.getWithKey(
+          m => typeof m === 'function' && m.prototype?.upload && m.prototype?.cancel,
+          { searchExports: true }
+        );
+        if (res?.[0]) {
+          const [container, key] = res;
+          if (tryPatch(container[key])) { found = true; BdApi.Logger.log(PLUGIN_NAME, 'CloudUpload patched (getWithKey)'); }
+        }
+      } catch {}
+    }
+
+    // 4. getByPrototypeKeys (BD 1.9+)
+    if (!found && typeof BdApi.Webpack.getByPrototypeKeys === 'function') {
+      try {
+        const m = BdApi.Webpack.getByPrototypeKeys('upload', 'cancel', 'handleComplete');
+        if (tryPatch(m)) { found = true; BdApi.Logger.log(PLUGIN_NAME, 'CloudUpload patched (getByPrototypeKeys)'); }
+      } catch {}
+    }
+
+    if (!found) BdApi.Logger.warn(PLUGIN_NAME, 'CloudUpload not found -- file auto-encrypt inactive. Open DevTools and check for [Discrypt] messages.');
   }
 
 
