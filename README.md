@@ -67,6 +67,11 @@ Discrypt uses **asymmetric PGP encryption** (via OpenPGP.js v6.3.0):
 
 ## Changelog
 
+### v1.5.1
+- Files attached in Discord's message field are now **automatically encrypted** when encryption mode is active — no separate Files tab needed
+- Patches Discord's internal `uploadFiles` module to intercept and encrypt attachments before they leave your client
+- Multiple attachments in a single message are all encrypted in parallel
+
 ### v1.5.0
 - Added **file encryption**: encrypt any file to a `.pgp` download via the new Files tab
 - Added **file decryption**: decrypt received `.pgp` files and restore the original
