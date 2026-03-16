@@ -810,6 +810,7 @@ module.exports = class Discrypt {
     if (this._toolbarInterval) clearInterval(this._toolbarInterval);
     document.querySelectorAll(".discrypt-toolbar-wrap").forEach(el => el.remove());
     document.querySelectorAll(".discrypt-dom-wrap").forEach(el => el.remove());
+    if (this._origFetch) { window.fetch = this._origFetch; this._origFetch = null; }
     BdApi.Logger.log(PLUGIN_NAME, "Discrypt stopped");
   }
 
@@ -904,98 +905,81 @@ module.exports = class Discrypt {
 
 
   patchFileUpload() {
-    // Try multiple strategies to locate the uploadFiles export
-    let uploadMod = null, uploadKey = "uploadFiles";
+    // Intercept at the fetch level -- reliable regardless of Discord internal module changes.
+    // Discord uploads files as multipart POST to /channels/{id}/messages.
+    const self = this;
+    const _origFetch = window.fetch.bind(window);
+    this._origFetch = _origFetch;
 
-    // Strategy 1: getWithKey searching all exports (BD 1.9+)
-    if (!uploadMod && typeof BdApi.Webpack.getWithKey === "function") {
-      try {
-        const res = BdApi.Webpack.getWithKey(
-          m => typeof m === "function" && m.toString?.().includes("uploadFiles"),
-          { searchExports: true }
-        );
-        if (res?.[0]) { [uploadMod, uploadKey] = res; }
-      } catch {}
-    }
+    window.fetch = async function(...args) {
+      const url  = typeof args[0] === "string" ? args[0] : (args[0]?.url ?? "");
+      const init = args[1] ?? {};
 
-    // Strategy 2: getByKeys (BD 1.8+)
-    if (!uploadMod && typeof BdApi.Webpack.getByKeys === "function") {
-      try {
-        const m = BdApi.Webpack.getByKeys("uploadFiles");
-        if (m?.uploadFiles) { uploadMod = m; uploadKey = "uploadFiles"; }
-      } catch {}
-    }
+      if (
+        (encryptNextMessage || alwaysEncrypt) &&
+        (init.method === "POST" || !init.method) &&
+        /\/channels\/\d+\/messages/.test(url) &&
+        init.body instanceof FormData
+      ) {
+        const formData = init.body;
+        const fileKeys = [...formData.keys()].filter(k => k.startsWith("files["));
 
-    // Strategy 3: classic getModule
-    if (!uploadMod) {
-      uploadMod = BdApi.Webpack.getModule(m => m && typeof m.uploadFiles === "function", { first: true });
-    }
+        if (fileKeys.length) {
+          const privKey = Store.get("privateKey", null);
+          if (!privKey) {
+            showNotice("No private key -- generate one in Settings", "error");
+            return _origFetch(...args);
+          }
 
-    if (!uploadMod) {
-      BdApi.Logger.warn(PLUGIN_NAME, "uploadFiles module not found -- file auto-encrypt unavailable");
-      return;
-    }
-    BdApi.Logger.log(PLUGIN_NAME, "uploadFiles patched via key:", uploadKey);
+          const channelId = url.match(/\/channels\/(\d+)\//)?.[1];
+          const ChannelStore =
+            BdApi.Webpack.getStore?.("ChannelStore") ??
+            BdApi.Webpack.getModule(m => m?.getChannel && m?.getDMFromUserId, { first: true }) ??
+            BdApi.Webpack.getModule(m => typeof m?.getChannel === "function", { first: true });
+          const channel = ChannelStore?.getChannel?.(channelId);
 
-    BdApi.Patcher.instead(PLUGIN_NAME, uploadMod, uploadKey, async (thisArg, args, originalFn) => {
-      if (!encryptNextMessage && !alwaysEncrypt) return originalFn.apply(thisArg, args);
+          let recipientId = null;
+          if (channel?.recipients?.length) {
+            const r = channel.recipients[0];
+            recipientId = (r && typeof r === "object") ? r.id : r;
+          }
 
-      const uploadArgs = args[0] ?? {};
-      const channelId  = uploadArgs.channelId;
-      const rawFiles   = uploadArgs.files ?? uploadArgs.uploads ?? [];
-      if (!rawFiles.length) return originalFn.apply(thisArg, args);
+          const contact = recipientId ? getContacts()[recipientId] : null;
+          if (!contact) {
+            const hint = recipientId ? ` (User ID: ${recipientId})` : " (could not detect recipient)";
+            showNotice(`No trusted contact for this DM. Import their key first.${hint}`, "warning");
+            encryptNextMessage = false; self.updateToolbarBtn();
+            return; // block upload -- no plaintext leak
+          }
 
-      const privKey = Store.get("privateKey", null);
-      if (!privKey) {
-        showNotice("No private key -- generate one in Settings", "error");
-        return originalFn.apply(thisArg, args);
+          try {
+            const newForm = new FormData();
+            for (const [key, value] of formData.entries()) {
+              if (key.startsWith("files[") && value instanceof File) {
+                const buf       = await value.arrayBuffer();
+                const encrypted = await encryptFile(buf, value.name, contact.armoredPublicKey, Store.get("publicKey", null));
+                const encFile   = new File([encrypted], value.name + ".pgp", { type: "application/octet-stream" });
+                newForm.append(key, encFile, encFile.name);
+              } else {
+                newForm.append(key, value);
+              }
+            }
+            encryptNextMessage = false; self.updateToolbarBtn();
+            showNotice("File" + (fileKeys.length > 1 ? "s" : "") + " encrypted and uploading...", "success");
+            args[1] = { ...init, body: newForm };
+          } catch (err) {
+            BdApi.Logger.error(PLUGIN_NAME, "File encryption error:", err);
+            showNotice("File encryption failed: " + err.message, "error");
+            encryptNextMessage = false; self.updateToolbarBtn();
+            return; // block upload on error
+          }
+        }
       }
 
-      const ChannelStore =
-        BdApi.Webpack.getStore?.("ChannelStore") ??
-        BdApi.Webpack.getModule(m => m?.getChannel && m?.getDMFromUserId, { first: true }) ??
-        BdApi.Webpack.getModule(m => typeof m?.getChannel === "function", { first: true });
-      const channel = ChannelStore?.getChannel?.(channelId);
-
-      let recipientId = null;
-      if (channel?.recipients?.length) {
-        const r = channel.recipients[0];
-        recipientId = (r && typeof r === "object") ? r.id : r;
-      }
-
-      const contact = recipientId ? getContacts()[recipientId] : null;
-      if (!contact) {
-        const hint = recipientId ? ` (User ID: ${recipientId})` : " (could not detect recipient)";
-        showNotice(`No trusted contact for this DM. Import their key first.${hint}`, "warning");
-        encryptNextMessage = false; this.updateToolbarBtn();
-        return;
-      }
-
-      try {
-        const encryptedFiles = await Promise.all(rawFiles.map(async (fileObj) => {
-          const actualFile = fileObj?.item?.file ?? fileObj?.file ?? fileObj;
-          if (!(actualFile instanceof File)) return fileObj;
-          const buf       = await actualFile.arrayBuffer();
-          const encrypted = await encryptFile(buf, actualFile.name, contact.armoredPublicKey, Store.get("publicKey", null));
-          const encFile   = new File([encrypted], actualFile.name + ".pgp", { type: "application/octet-stream" });
-          if (fileObj?.item?.file !== undefined) return { ...fileObj, item: { ...fileObj.item, file: encFile } };
-          if (fileObj?.file !== undefined)        return { ...fileObj, file: encFile };
-          return encFile;
-        }));
-
-        encryptNextMessage = false; this.updateToolbarBtn();
-        showNotice("File" + (rawFiles.length > 1 ? "s" : "") + " encrypted and uploading...", "success");
-        const filesKey = uploadArgs.uploads !== undefined ? "uploads" : "files";
-        args[0] = { ...uploadArgs, [filesKey]: encryptedFiles };
-        return originalFn.apply(thisArg, args);
-      } catch (err) {
-        BdApi.Logger.error(PLUGIN_NAME, "File encryption error:", err);
-        showNotice("File encryption failed: " + err.message, "error");
-        encryptNextMessage = false; this.updateToolbarBtn();
-        return;
-      }
-    });
+      return _origFetch(...args);
+    };
   }
+
   patchMessageRender() {
     let patched = false;
 
