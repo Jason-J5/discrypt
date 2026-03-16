@@ -810,7 +810,8 @@ module.exports = class Discrypt {
     if (this._toolbarInterval) clearInterval(this._toolbarInterval);
     document.querySelectorAll(".discrypt-toolbar-wrap").forEach(el => el.remove());
     document.querySelectorAll(".discrypt-dom-wrap").forEach(el => el.remove());
-    if (this._origFetch) { window.fetch = this._origFetch; this._origFetch = null; }
+    if (this._xhrOpenPatch) { XMLHttpRequest.prototype.open = this._xhrOpenPatch; this._xhrOpenPatch = null; }
+    if (this._xhrSendPatch) { XMLHttpRequest.prototype.send = this._xhrSendPatch; this._xhrSendPatch = null; }
     BdApi.Logger.log(PLUGIN_NAME, "Discrypt stopped");
   }
 
@@ -905,80 +906,87 @@ module.exports = class Discrypt {
 
 
   patchFileUpload() {
-    // Intercept at the fetch level -- reliable regardless of Discord internal module changes.
-    // Discord uploads files as multipart POST to /channels/{id}/messages.
+    // Patch XMLHttpRequest.prototype  Discord uses XHR (not fetch) for multipart file uploads.
     const self = this;
-    const _origFetch = window.fetch.bind(window);
-    this._origFetch = _origFetch;
+    const _origOpen = XMLHttpRequest.prototype.open;
+    const _origSend = XMLHttpRequest.prototype.send;
+    this._xhrOpenPatch = _origOpen;
+    this._xhrSendPatch = _origSend;
 
-    window.fetch = async function(...args) {
-      const url  = typeof args[0] === "string" ? args[0] : (args[0]?.url ?? "");
-      const init = args[1] ?? {};
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+      this._discryptMethod = method;
+      this._discryptUrl    = url;
+      return _origOpen.call(this, method, url, ...rest);
+    };
 
+    XMLHttpRequest.prototype.send = function(body) {
+      const xhr = this;
       if (
         (encryptNextMessage || alwaysEncrypt) &&
-        (init.method === "POST" || !init.method) &&
-        /\/channels\/\d+\/messages/.test(url) &&
-        init.body instanceof FormData
+        xhr._discryptUrl &&
+        /\/channels\/\d+\/messages/.test(xhr._discryptUrl) &&
+        body instanceof FormData
       ) {
-        const formData = init.body;
-        const fileKeys = [...formData.keys()].filter(k => k.startsWith("files["));
-
+        const fileKeys = [...body.keys()].filter(k => k.startsWith('files['));
         if (fileKeys.length) {
-          const privKey = Store.get("privateKey", null);
+          const privKey = Store.get('privateKey', null);
           if (!privKey) {
-            showNotice("No private key -- generate one in Settings", "error");
-            return _origFetch(...args);
+            showNotice('No private key -- generate one in Settings', 'error');
+            return _origSend.call(xhr, body);
           }
 
-          const channelId = url.match(/\/channels\/(\d+)\//)?.[1];
+          const channelId = (xhr._discryptUrl.match(/\/channels\/(\d+)\//) || [])[1];
           const ChannelStore =
-            BdApi.Webpack.getStore?.("ChannelStore") ??
+            BdApi.Webpack.getStore?.('ChannelStore') ??
             BdApi.Webpack.getModule(m => m?.getChannel && m?.getDMFromUserId, { first: true }) ??
-            BdApi.Webpack.getModule(m => typeof m?.getChannel === "function", { first: true });
+            BdApi.Webpack.getModule(m => typeof m?.getChannel === 'function', { first: true });
           const channel = ChannelStore?.getChannel?.(channelId);
 
           let recipientId = null;
           if (channel?.recipients?.length) {
             const r = channel.recipients[0];
-            recipientId = (r && typeof r === "object") ? r.id : r;
+            recipientId = (r && typeof r === 'object') ? r.id : r;
           }
 
           const contact = recipientId ? getContacts()[recipientId] : null;
           if (!contact) {
-            const hint = recipientId ? ` (User ID: ${recipientId})` : " (could not detect recipient)";
-            showNotice(`No trusted contact for this DM. Import their key first.${hint}`, "warning");
+            const hint = recipientId ? ' (User ID: ' + recipientId + ')' : ' (could not detect recipient)';
+            showNotice('No trusted contact for this DM. Import their key first.' + hint, 'warning');
             encryptNextMessage = false; self.updateToolbarBtn();
-            return; // block upload -- no plaintext leak
+            return; // block upload
           }
 
-          try {
-            const newForm = new FormData();
-            for (const [key, value] of formData.entries()) {
-              if (key.startsWith("files[") && value instanceof File) {
-                const buf       = await value.arrayBuffer();
-                const encrypted = await encryptFile(buf, value.name, contact.armoredPublicKey, Store.get("publicKey", null));
-                const encFile   = new File([encrypted], value.name + ".pgp", { type: "application/octet-stream" });
-                newForm.append(key, encFile, encFile.name);
-              } else {
-                newForm.append(key, value);
+          // Async: encrypt then send
+          (async () => {
+            try {
+              const newForm = new FormData();
+              for (const [key, value] of body.entries()) {
+                if (key.startsWith('files[') && value instanceof File) {
+                  const buf       = await value.arrayBuffer();
+                  const encrypted = await encryptFile(buf, value.name, contact.armoredPublicKey, Store.get('publicKey', null));
+                  const encFile   = new File([encrypted], value.name + '.pgp', { type: 'application/octet-stream' });
+                  newForm.append(key, encFile, encFile.name);
+                } else {
+                  newForm.append(key, value);
+                }
               }
+              encryptNextMessage = false; self.updateToolbarBtn();
+              showNotice('File' + (fileKeys.length > 1 ? 's' : '') + ' encrypted and uploading...', 'success');
+              _origSend.call(xhr, newForm);
+            } catch (err) {
+              BdApi.Logger.error(PLUGIN_NAME, 'File encryption error:', err);
+              showNotice('File encryption failed: ' + err.message, 'error');
+              encryptNextMessage = false; self.updateToolbarBtn();
+              // do not send -- block on error
             }
-            encryptNextMessage = false; self.updateToolbarBtn();
-            showNotice("File" + (fileKeys.length > 1 ? "s" : "") + " encrypted and uploading...", "success");
-            args[1] = { ...init, body: newForm };
-          } catch (err) {
-            BdApi.Logger.error(PLUGIN_NAME, "File encryption error:", err);
-            showNotice("File encryption failed: " + err.message, "error");
-            encryptNextMessage = false; self.updateToolbarBtn();
-            return; // block upload on error
-          }
+          })();
+          return; // defer send to async block above
         }
       }
-
-      return _origFetch(...args);
+      return _origSend.call(this, body);
     };
   }
+
 
   patchMessageRender() {
     let patched = false;
