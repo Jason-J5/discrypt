@@ -2,7 +2,7 @@
  * @name Discrypt
  * @author Discrypt
  * @description End-to-end PGP encryption for Discord. Manage keys, encrypt/decrypt messages and files, and share public keys as contact cards.
- * @version 1.5.0
+ * @version 1.5.1
  * @source https://github.com/
  */
 
@@ -792,6 +792,7 @@ module.exports = class Discrypt {
     if (alwaysEncrypt) document.body.classList.add("discrypt-always-on");
     BdApi.DOM.addStyle(PLUGIN_NAME, CSS);
     this.patchMessageSend();
+    this.patchFileUpload();
     this.patchMessageRender();
     this.patchToolbar();
     this.patchContextMenu();
@@ -895,6 +896,64 @@ module.exports = class Discrypt {
         return originalFn.apply(thisArg, args);
       } catch (err) {
         showNotice("Encryption failed: " + err.message, "error");
+        encryptNextMessage = false; this.updateToolbarBtn();
+        return;
+      }
+    });
+  }
+
+
+  patchFileUpload() {
+    const UploadModule = BdApi.Webpack.getModule(m => m && typeof m.uploadFiles === "function", { first: true });
+    if (!UploadModule) { BdApi.Logger.warn(PLUGIN_NAME, "uploadFiles module not found -- file auto-encrypt unavailable"); return; }
+
+    BdApi.Patcher.instead(PLUGIN_NAME, UploadModule, "uploadFiles", async (thisArg, args, originalFn) => {
+      if (!encryptNextMessage && !alwaysEncrypt) return originalFn.apply(thisArg, args);
+
+      const { channelId, files } = args[0] ?? {};
+      if (!files || !files.length) return originalFn.apply(thisArg, args);
+
+      const privKey = Store.get("privateKey", null);
+      if (!privKey) {
+        showNotice("No private key -- generate one in Settings", "error");
+        return originalFn.apply(thisArg, args);
+      }
+
+      const ChannelStore =
+        BdApi.Webpack.getStore?.("ChannelStore") ??
+        BdApi.Webpack.getModule(m => m?.getChannel && m?.getDMFromUserId, { first: true }) ??
+        BdApi.Webpack.getModule(m => typeof m?.getChannel === "function", { first: true });
+      const channel = ChannelStore?.getChannel?.(channelId);
+
+      let recipientId = null;
+      if (channel?.recipients?.length) {
+        const r = channel.recipients[0];
+        recipientId = (r && typeof r === "object") ? r.id : r;
+      }
+
+      const contact = recipientId ? getContacts()[recipientId] : null;
+      if (!contact) {
+        const hint = recipientId ? ` (their User ID: ${recipientId})` : " (could not detect recipient)";
+        showNotice(`No trusted contact for this DM. Import their public key first.${hint}`, "warning");
+        encryptNextMessage = false; this.updateToolbarBtn();
+        return;
+      }
+
+      try {
+        const encryptedFiles = await Promise.all(files.map(async (fileObj) => {
+          const file = fileObj.file ?? fileObj;
+          const buf  = await file.arrayBuffer();
+          const encrypted = await encryptFile(buf, file.name, contact.armoredPublicKey, Store.get("publicKey", null));
+          const encFile   = new File([encrypted], file.name + ".pgp", { type: "application/octet-stream" });
+          return { ...fileObj, file: encFile };
+        }));
+
+        encryptNextMessage = false; this.updateToolbarBtn();
+        showNotice("File" + (files.length > 1 ? "s" : "") + " encrypted and uploading...", "success");
+        args[0] = { ...args[0], files: encryptedFiles };
+        return originalFn.apply(thisArg, args);
+      } catch (err) {
+        showNotice("File encryption failed: " + err.message, "error");
         encryptNextMessage = false; this.updateToolbarBtn();
         return;
       }
