@@ -904,14 +904,46 @@ module.exports = class Discrypt {
 
 
   patchFileUpload() {
-    const UploadModule = BdApi.Webpack.getModule(m => m && typeof m.uploadFiles === "function", { first: true });
-    if (!UploadModule) { BdApi.Logger.warn(PLUGIN_NAME, "uploadFiles module not found -- file auto-encrypt unavailable"); return; }
+    // Try multiple strategies to locate the uploadFiles export
+    let uploadMod = null, uploadKey = "uploadFiles";
 
-    BdApi.Patcher.instead(PLUGIN_NAME, UploadModule, "uploadFiles", async (thisArg, args, originalFn) => {
+    // Strategy 1: getWithKey searching all exports (BD 1.9+)
+    if (!uploadMod && typeof BdApi.Webpack.getWithKey === "function") {
+      try {
+        const res = BdApi.Webpack.getWithKey(
+          m => typeof m === "function" && m.toString?.().includes("uploadFiles"),
+          { searchExports: true }
+        );
+        if (res?.[0]) { [uploadMod, uploadKey] = res; }
+      } catch {}
+    }
+
+    // Strategy 2: getByKeys (BD 1.8+)
+    if (!uploadMod && typeof BdApi.Webpack.getByKeys === "function") {
+      try {
+        const m = BdApi.Webpack.getByKeys("uploadFiles");
+        if (m?.uploadFiles) { uploadMod = m; uploadKey = "uploadFiles"; }
+      } catch {}
+    }
+
+    // Strategy 3: classic getModule
+    if (!uploadMod) {
+      uploadMod = BdApi.Webpack.getModule(m => m && typeof m.uploadFiles === "function", { first: true });
+    }
+
+    if (!uploadMod) {
+      BdApi.Logger.warn(PLUGIN_NAME, "uploadFiles module not found -- file auto-encrypt unavailable");
+      return;
+    }
+    BdApi.Logger.log(PLUGIN_NAME, "uploadFiles patched via key:", uploadKey);
+
+    BdApi.Patcher.instead(PLUGIN_NAME, uploadMod, uploadKey, async (thisArg, args, originalFn) => {
       if (!encryptNextMessage && !alwaysEncrypt) return originalFn.apply(thisArg, args);
 
-      const { channelId, files } = args[0] ?? {};
-      if (!files || !files.length) return originalFn.apply(thisArg, args);
+      const uploadArgs = args[0] ?? {};
+      const channelId  = uploadArgs.channelId;
+      const rawFiles   = uploadArgs.files ?? uploadArgs.uploads ?? [];
+      if (!rawFiles.length) return originalFn.apply(thisArg, args);
 
       const privKey = Store.get("privateKey", null);
       if (!privKey) {
@@ -933,33 +965,37 @@ module.exports = class Discrypt {
 
       const contact = recipientId ? getContacts()[recipientId] : null;
       if (!contact) {
-        const hint = recipientId ? ` (their User ID: ${recipientId})` : " (could not detect recipient)";
-        showNotice(`No trusted contact for this DM. Import their public key first.${hint}`, "warning");
+        const hint = recipientId ? ` (User ID: ${recipientId})` : " (could not detect recipient)";
+        showNotice(`No trusted contact for this DM. Import their key first.${hint}`, "warning");
         encryptNextMessage = false; this.updateToolbarBtn();
         return;
       }
 
       try {
-        const encryptedFiles = await Promise.all(files.map(async (fileObj) => {
-          const file = fileObj.file ?? fileObj;
-          const buf  = await file.arrayBuffer();
-          const encrypted = await encryptFile(buf, file.name, contact.armoredPublicKey, Store.get("publicKey", null));
-          const encFile   = new File([encrypted], file.name + ".pgp", { type: "application/octet-stream" });
-          return { ...fileObj, file: encFile };
+        const encryptedFiles = await Promise.all(rawFiles.map(async (fileObj) => {
+          const actualFile = fileObj?.item?.file ?? fileObj?.file ?? fileObj;
+          if (!(actualFile instanceof File)) return fileObj;
+          const buf       = await actualFile.arrayBuffer();
+          const encrypted = await encryptFile(buf, actualFile.name, contact.armoredPublicKey, Store.get("publicKey", null));
+          const encFile   = new File([encrypted], actualFile.name + ".pgp", { type: "application/octet-stream" });
+          if (fileObj?.item?.file !== undefined) return { ...fileObj, item: { ...fileObj.item, file: encFile } };
+          if (fileObj?.file !== undefined)        return { ...fileObj, file: encFile };
+          return encFile;
         }));
 
         encryptNextMessage = false; this.updateToolbarBtn();
-        showNotice("File" + (files.length > 1 ? "s" : "") + " encrypted and uploading...", "success");
-        args[0] = { ...args[0], files: encryptedFiles };
+        showNotice("File" + (rawFiles.length > 1 ? "s" : "") + " encrypted and uploading...", "success");
+        const filesKey = uploadArgs.uploads !== undefined ? "uploads" : "files";
+        args[0] = { ...uploadArgs, [filesKey]: encryptedFiles };
         return originalFn.apply(thisArg, args);
       } catch (err) {
+        BdApi.Logger.error(PLUGIN_NAME, "File encryption error:", err);
         showNotice("File encryption failed: " + err.message, "error");
         encryptNextMessage = false; this.updateToolbarBtn();
         return;
       }
     });
   }
-
   patchMessageRender() {
     let patched = false;
 
